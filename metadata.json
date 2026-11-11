@@ -1,0 +1,6 @@
+{
+  "name": "adibi Ielts",
+  "description": "adibi Ielts - Smart English Learning and IELTS Preparation Partner with Grammar Analysis and Vocabulary Builder",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
