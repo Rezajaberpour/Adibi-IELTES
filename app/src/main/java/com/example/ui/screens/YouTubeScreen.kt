@@ -64,9 +64,11 @@ import com.example.data.model.YouTubeLessonData
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.rememberCoroutineScope
+import coil.compose.AsyncImage
 import com.example.data.repository.YouTubeSyncRepository
+import com.example.ui.theme.EmeraldSuccess
 
 @Composable
 fun YouTubeScreen(
@@ -75,11 +77,14 @@ fun YouTubeScreen(
 ) {
     val context = LocalContext.current
     val channelUrl = YouTubeLessonData.OFFICIAL_CHANNEL_URL
-    val coroutineScope = rememberCoroutineScope()
 
     val allLessons by YouTubeSyncRepository.lessons.collectAsState()
     val isSyncing by YouTubeSyncRepository.isSyncing.collectAsState()
     val syncMessage by YouTubeSyncRepository.syncMessage.collectAsState()
+
+    LaunchedEffect(Unit) {
+        YouTubeSyncRepository.syncIfNeeded(context)
+    }
 
     var selectedSeries by remember { mutableStateOf("همه سرفصل‌ها") }
 
@@ -299,16 +304,16 @@ fun YouTubeScreen(
 
                                 IconButton(
                                     onClick = {
-                                        YouTubeSyncRepository.syncLatestContent(coroutineScope)
+                                        YouTubeSyncRepository.syncLatestContent(context = context)
                                     },
                                     enabled = !isSyncing,
-                                    modifier = Modifier.size(32.dp).testTag("refresh_youtube_feed_btn")
+                                    modifier = Modifier.size(48.dp).testTag("refresh_youtube_feed_btn")
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Refresh,
                                         contentDescription = "بروزرسانی از یوتیوب",
                                         tint = refreshTint,
-                                        modifier = Modifier.size(18.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }
@@ -401,6 +406,58 @@ private fun CuratedYouTubeLessonCard(
                 .fillMaxWidth()
                 .padding(14.dp)
         ) {
+            if (lesson.thumbnailUrl.isNotBlank()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(165.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .clickable { onOpenVideo() }
+                ) {
+                    AsyncImage(
+                        model = lesson.thumbnailUrl,
+                        contentDescription = lesson.titleEnglish,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.65f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = "پخش ویدیو در یوتیوب",
+                            tint = Color.White,
+                            modifier = Modifier.size(30.dp)
+                        )
+                    }
+                    if (lesson.publishedAt.isNotBlank()) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                text = lesson.publishedAt,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color.White,
+                                    fontSize = 10.sp
+                                ),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
@@ -434,6 +491,25 @@ private fun CuratedYouTubeLessonCard(
                         ),
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
                     )
+                }
+
+                if (lesson.isLiveSynced) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = EmeraldSuccess.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "کانال یوتیوب",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = EmeraldSuccess,
+                                fontSize = 10.sp,
+                                textDirection = TextDirection.Rtl
+                            ),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.weight(1f))

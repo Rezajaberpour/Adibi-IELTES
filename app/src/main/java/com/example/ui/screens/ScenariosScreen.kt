@@ -64,8 +64,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.rememberCoroutineScope
 import com.example.data.repository.YouTubeSyncRepository
 
 data class YouTubeEducationalTip(
@@ -81,11 +81,14 @@ fun ScenariosScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
 
     val allScenarios by YouTubeSyncRepository.scenarios.collectAsState()
     val isSyncing by YouTubeSyncRepository.isSyncing.collectAsState()
     val syncMessage by YouTubeSyncRepository.syncMessage.collectAsState()
+
+    LaunchedEffect(Unit) {
+        YouTubeSyncRepository.syncIfNeeded(context)
+    }
 
     val openYouTubeChannel = {
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://youtube.com/@adibilearnskills?si=e9kQ2rrem3921gXT"))
@@ -230,16 +233,16 @@ fun ScenariosScreen(
 
                             IconButton(
                                 onClick = {
-                                    YouTubeSyncRepository.syncLatestContent(coroutineScope)
+                                    YouTubeSyncRepository.syncLatestContent(context = context)
                                 },
                                 enabled = !isSyncing,
-                                modifier = Modifier.size(32.dp).testTag("refresh_scenarios_feed_btn")
+                                modifier = Modifier.size(48.dp).testTag("refresh_scenarios_feed_btn")
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Refresh,
                                     contentDescription = "بروزرسانی سناریوها",
                                     tint = refreshTint,
-                                    modifier = Modifier.size(18.dp)
+                                    modifier = Modifier.size(20.dp)
                                 )
                             }
                         }

@@ -1,5 +1,6 @@
 package com.example.data.repository
 
+import android.content.Context
 import com.example.data.api.YouTubeFeedEntry
 import com.example.data.api.YouTubeFeedParser
 import com.example.data.model.PracticeScenario
@@ -8,24 +9,57 @@ import com.example.data.model.YouTubeLesson
 import com.example.data.model.YouTubeLessonData
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLException
 
 object YouTubeSyncRepository {
 
-    private const val CHANNEL_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UC7nsJq5hVH6xvl7ZkdrOKkw"
+    private const val CHANNEL_ID = "UC7nsJq5hVH6xvl7ZkdrOKkw"
+    private val RSS_ENDPOINTS = listOf(
+        "https://www.youtube.com/feeds/videos.xml?channel_id=$CHANNEL_ID",
+        "https://youtube.com/feeds/videos.xml?channel_id=$CHANNEL_ID"
+    )
+    private val HTML_ENDPOINTS = listOf(
+        "https://www.youtube.com/@adibilearnskills/videos",
+        "https://www.youtube.com/channel/$CHANNEL_ID/videos"
+    )
     const val CHANNEL_WEB_URL = "https://youtube.com/@adibilearnskills?si=e9kQ2rrem3921gXT"
+
+    private const val PREFS_NAME = "yt_channel_sync_cache_v2"
+    private const val KEY_CACHED_ENTRIES = "cached_entries_json"
+    private const val KEY_LAST_SYNC_TIME = "last_sync_time"
+
+    private val syncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS))
         .build()
+
+    @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
+    private var cacheLoaded = false
 
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
@@ -33,7 +67,13 @@ object YouTubeSyncRepository {
     private val _lastSyncTime = MutableStateFlow<Long?>(null)
     val lastSyncTime: StateFlow<Long?> = _lastSyncTime.asStateFlow()
 
-    private val _syncMessage = MutableStateFlow("آماده به‌روزرسانی")
+    private val _lastSyncSucceeded = MutableStateFlow(false)
+    val lastSyncSucceeded: StateFlow<Boolean> = _lastSyncSucceeded.asStateFlow()
+
+    private val _syncedVideoCount = MutableStateFlow(0)
+    val syncedVideoCount: StateFlow<Int> = _syncedVideoCount.asStateFlow()
+
+    private val _syncMessage = MutableStateFlow("آماده همگام‌سازی با یوتیوب")
     val syncMessage: StateFlow<String> = _syncMessage.asStateFlow()
 
     private val _lessons = MutableStateFlow<List<YouTubeLesson>>(YouTubeLessonData.lessonsList)
@@ -42,69 +82,314 @@ object YouTubeSyncRepository {
     private val _scenarios = MutableStateFlow<List<PracticeScenario>>(ScenarioData.scenariosList)
     val scenarios: StateFlow<List<PracticeScenario>> = _scenarios.asStateFlow()
 
-    /**
-     * Called whenever the app is opened or when the user pulls to refresh.
-     * Fetches real-time video feed from @adibilearnskills YouTube channel,
-     * builds and appends dynamic lessons and practice scenarios.
-     */
-    fun syncLatestContent(scope: CoroutineScope, onComplete: ((Boolean) -> Unit)? = null) {
-        if (_isSyncing.value) return
-
-        scope.launch {
-            _isSyncing.value = true
-            _syncMessage.value = "در حال دریافت آخرین آموزش‌ها و سناریوها از کانال یوتیوب..."
-
-            val success = withContext(Dispatchers.IO) {
-                try {
-                    val request = Request.Builder()
-                        .url(CHANNEL_FEED_URL)
-                        .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0")
-                        .header("Accept", "application/atom+xml,application/xml,text/xml")
-                        .build()
-
-                    val response = client.newCall(request).execute()
-                    if (response.isSuccessful) {
-                        val bodyString = response.body?.string() ?: ""
-                        if (bodyString.isNotBlank()) {
-                            val entries = YouTubeFeedParser.parse(bodyString)
-                            if (entries.isNotEmpty()) {
-                                processFeedEntries(entries)
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    false
-                }
-            }
-
-            _isSyncing.value = false
-            if (success) {
-                _lastSyncTime.value = System.currentTimeMillis()
-                _syncMessage.value = "آموزش‌ها و سناریوهای جدید از کانال @adibilearnskills اضافه شد"
-            } else {
-                _syncMessage.value = "عدم دسترسی به اینترنت؛ مطالب آفلاین بارگذاری شد"
-            }
-            onComplete?.invoke(success)
+    fun init(context: Context) {
+        if (appContext == null) {
+            appContext = context.applicationContext
+        }
+        if (!cacheLoaded) {
+            cacheLoaded = true
+            loadCachedEntries()
         }
     }
 
-    private fun processFeedEntries(entries: List<YouTubeFeedEntry>) {
+    /**
+     * Triggers sync automatically when the app opens or when visiting YouTube/Scenarios tabs
+     * if content hasn't been successfully synced yet in this session.
+     */
+    fun syncIfNeeded(context: Context? = null) {
+        if (context != null) init(context)
+        if (_isSyncing.value) return
+        if (!_lastSyncSucceeded.value) {
+            syncLatestContent(context = context)
+        }
+    }
+
+    /**
+     * Backward-compatible overload accepting a CoroutineScope (ignored internally in favor of
+     * a lifecycle-independent SupervisorJob scope so navigation never cancels or deadlocks sync).
+     */
+    fun syncLatestContent(scope: CoroutineScope, context: Context? = null, onComplete: ((Boolean) -> Unit)? = null) {
+        syncLatestContent(context = context, onComplete = onComplete)
+    }
+
+    /**
+     * Fetches real-time video feed from @adibilearnskills YouTube channel using:
+     * 1) Official Atom RSS Feed (rich descriptions + timestamps)
+     * 2) Official Channel /videos HTML ytInitialData fallback/extension (up to 30 videos)
+     * Persists fetched entries locally so newly added videos survive offline restarts.
+     */
+    fun syncLatestContent(
+        context: Context? = null,
+        onComplete: ((Boolean) -> Unit)? = null
+    ) {
+        if (context != null) init(context)
+        if (_isSyncing.value) return
+
+        syncScope.launch {
+            _isSyncing.value = true
+            _syncMessage.value = "در حال دریافت آخرین ویدیوها و سناریوها از کانال @adibilearnskills..."
+
+            var lastError: Exception? = null
+            var lastHttpCode: Int? = null
+            var syncedEntries: List<YouTubeFeedEntry> = emptyList()
+
+            try {
+                // Step 1: Fetch official YouTube Atom RSS feed (newest 15 videos with full descriptions)
+                var rssEntries: List<YouTubeFeedEntry> = emptyList()
+                for (url in RSS_ENDPOINTS) {
+                    try {
+                        val request = Request.Builder()
+                            .url(url)
+                            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
+                            .header("Accept", "application/atom+xml,application/xml,text/xml,*/*")
+                            .header("Accept-Language", "en-US,en;q=0.9")
+                            .build()
+
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val body = response.body?.string().orEmpty()
+                                val parsed = YouTubeFeedParser.parse(body)
+                                if (parsed.isNotEmpty()) {
+                                    rssEntries = parsed
+                                }
+                            } else {
+                                lastHttpCode = response.code
+                            }
+                        }
+                        if (rssEntries.isNotEmpty()) break
+                    } catch (e: Exception) {
+                        lastError = e
+                    }
+                }
+
+                // Step 2: Fetch Channel /videos page HTML (fallback if RSS failed, or to extend beyond 15 videos)
+                var htmlEntries: List<YouTubeFeedEntry> = emptyList()
+                for (url in HTML_ENDPOINTS) {
+                    try {
+                        val request = Request.Builder()
+                            .url(url)
+                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                            .header("Accept-Language", "en-US,en;q=0.9")
+                            .header("Cookie", "CONSENT=YES+cb.20210328-17-p0.en+FX+417; SOCS=CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg")
+                            .build()
+
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                val html = response.body?.string().orEmpty()
+                                val parsed = YouTubeFeedParser.parseChannelVideosHtml(html)
+                                if (parsed.isNotEmpty()) {
+                                    htmlEntries = parsed
+                                }
+                            } else if (lastHttpCode == null) {
+                                lastHttpCode = response.code
+                            }
+                        }
+                        if (htmlEntries.isNotEmpty()) break
+                    } catch (e: Exception) {
+                        if (lastError == null) lastError = e
+                    }
+                }
+
+                // Step 3: Merge RSS + HTML entries cleanly (RSS entries have richer descriptions & ISO dates)
+                syncedEntries = mergeRssAndHtmlEntries(rssEntries, htmlEntries)
+
+                if (syncedEntries.isNotEmpty()) {
+                    // Merge with any previously cached entries so older synced items aren't lost
+                    val previousCached = readCachedEntriesFromPrefs()
+                    val combinedEntries = mergeWithPreviousCache(syncedEntries, previousCached)
+                    saveCachedEntriesToPrefs(combinedEntries)
+                    processFeedEntries(combinedEntries, isLive = true)
+
+                    val now = System.currentTimeMillis()
+                    _lastSyncTime.value = now
+                    _lastSyncSucceeded.value = true
+                    _syncedVideoCount.value = combinedEntries.size
+                    saveLastSyncTime(now)
+
+                    _syncMessage.value = "${combinedEntries.size} ویدیو و سناریو از کانال @adibilearnskills همگام‌سازی شد"
+                    onComplete?.invoke(true)
+                } else {
+                    val reason = buildFriendlyErrorMessage(lastError, lastHttpCode)
+                    val cachedCount = _syncedVideoCount.value
+                    _syncMessage.value = if (cachedCount > 0) {
+                        "$reason ($cachedCount ویدیوی ذخیره‌شده فعال است)"
+                    } else {
+                        "$reason؛ مطالب پایه بارگذاری شد"
+                    }
+                    onComplete?.invoke(false)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                val reason = buildFriendlyErrorMessage(e, lastHttpCode)
+                _syncMessage.value = "$reason؛ مطالب ذخیره‌شده بارگذاری شد"
+                onComplete?.invoke(false)
+            } finally {
+                _isSyncing.value = false
+            }
+        }
+    }
+
+    private fun buildFriendlyErrorMessage(error: Exception?, httpCode: Int?): String {
+        return when (error) {
+            is UnknownHostException, is ConnectException ->
+                "عدم دسترسی به یوتیوب (اینترنت یا فیلترشکن را بررسی کنید)"
+            is SocketTimeoutException ->
+                "اتصال به یوتیوب زمان‌بر شد (فیلترشکن یا اینترنت را بررسی کنید)"
+            is SSLException ->
+                "خطای امنیت اتصال SSL به یوتیوب"
+            is IOException ->
+                "خطا در برقراری ارتباط با یوتیوب"
+            else -> if (httpCode != null) {
+                "خطای سرور یوتیوب (کد $httpCode)"
+            } else {
+                "امکان دریافت ویدیوهای جدید از یوتیوب برقرار نشد"
+            }
+        }
+    }
+
+    private fun mergeRssAndHtmlEntries(
+        rssEntries: List<YouTubeFeedEntry>,
+        htmlEntries: List<YouTubeFeedEntry>
+    ): List<YouTubeFeedEntry> {
+        if (rssEntries.isEmpty()) return htmlEntries
+        if (htmlEntries.isEmpty()) return rssEntries
+
+        val rssById = rssEntries.associateBy { it.videoId }
+        val result = mutableListOf<YouTubeFeedEntry>()
+        val seenIds = HashSet<String>()
+
+        // Preserve newest order from HTML (which lists up to 30 videos newest-first), enriching with RSS details
+        for (htmlItem in htmlEntries) {
+            if (seenIds.add(htmlItem.videoId)) {
+                val rssMatch = rssById[htmlItem.videoId]
+                if (rssMatch != null) {
+                    result.add(
+                        rssMatch.copy(
+                            thumbnailUrl = rssMatch.thumbnailUrl.ifBlank { htmlItem.thumbnailUrl }
+                        )
+                    )
+                } else {
+                    result.add(htmlItem)
+                }
+            }
+        }
+
+        // Ensure any RSS item not in HTML is included at the top
+        val missingFromHtml = rssEntries.filter { seenIds.add(it.videoId) }
+        return missingFromHtml + result
+    }
+
+    private fun mergeWithPreviousCache(
+        fresh: List<YouTubeFeedEntry>,
+        previous: List<YouTubeFeedEntry>
+    ): List<YouTubeFeedEntry> {
+        val merged = mutableListOf<YouTubeFeedEntry>()
+        val seen = HashSet<String>()
+        for (entry in fresh) {
+            if (seen.add(entry.videoId)) {
+                merged.add(entry)
+            }
+        }
+        for (old in previous) {
+            if (seen.add(old.videoId)) {
+                merged.add(old)
+            }
+        }
+        return merged.take(60)
+    }
+
+    private fun loadCachedEntries() {
+        val cached = readCachedEntriesFromPrefs()
+        if (cached.isNotEmpty()) {
+            _syncedVideoCount.value = cached.size
+            val lastSync = appContext
+                ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                ?.getLong(KEY_LAST_SYNC_TIME, 0L) ?: 0L
+            if (lastSync > 0L) {
+                _lastSyncTime.value = lastSync
+            }
+            processFeedEntries(cached, isLive = true)
+            _syncMessage.value = "${cached.size} ویدیو از حافظه همگام‌سازی‌شده بارگذاری شد"
+        }
+    }
+
+    private fun readCachedEntriesFromPrefs(): List<YouTubeFeedEntry> {
+        val ctx = appContext ?: return emptyList()
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val raw = prefs.getString(KEY_CACHED_ENTRIES, null) ?: return emptyList()
+            val arr = JSONArray(raw)
+            val list = mutableListOf<YouTubeFeedEntry>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val vid = obj.optString("videoId", "")
+                val title = obj.optString("title", "")
+                if (vid.isNotBlank() && title.isNotBlank()) {
+                    list.add(
+                        YouTubeFeedEntry(
+                            videoId = vid,
+                            title = title,
+                            link = obj.optString("link", "https://www.youtube.com/watch?v=$vid"),
+                            published = obj.optString("published", ""),
+                            description = obj.optString("description", ""),
+                            thumbnailUrl = obj.optString("thumbnailUrl", "https://i.ytimg.com/vi/$vid/hqdefault.jpg")
+                        )
+                    )
+                }
+            }
+            list
+        } catch (e: Exception) {
+            e.printStackTrace()
+            emptyList()
+        }
+    }
+
+    private fun saveCachedEntriesToPrefs(entries: List<YouTubeFeedEntry>) {
+        val ctx = appContext ?: return
+        try {
+            val arr = JSONArray()
+            for (entry in entries) {
+                val obj = JSONObject().apply {
+                    put("videoId", entry.videoId)
+                    put("title", entry.title)
+                    put("link", entry.link)
+                    put("published", entry.published)
+                    put("description", entry.description)
+                    put("thumbnailUrl", entry.thumbnailUrl)
+                }
+                arr.put(obj)
+            }
+            ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_CACHED_ENTRIES, arr.toString())
+                .apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun saveLastSyncTime(timeMs: Long) {
+        val ctx = appContext ?: return
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(KEY_LAST_SYNC_TIME, timeMs)
+            .apply()
+    }
+
+    /**
+     * Exposed internally for unit testing and feed transformation verification.
+     */
+    internal fun processFeedEntries(entries: List<YouTubeFeedEntry>, isLive: Boolean = true) {
         val newLessons = mutableListOf<YouTubeLesson>()
         val newScenarios = mutableListOf<PracticeScenario>()
 
-        for (entry in entries) {
+        for (entry in entries.distinctBy { it.videoId }) {
             val scenarioId = "scenario_yt_${entry.videoId}"
             val lessonId = "lesson_yt_${entry.videoId}"
 
             val parsedInfo = parseVideoTitleAndDetails(entry.title, entry.description)
+            val displayPublished = formatPublishedDate(entry.published)
 
             val lesson = YouTubeLesson(
                 id = lessonId,
@@ -117,7 +402,10 @@ object YouTubeSyncRepository {
                 keyPoints = parsedInfo.keyPoints,
                 targetScenarioId = scenarioId,
                 videoUrl = "https://www.youtube.com/watch?v=${entry.videoId}",
-                bandScore = parsedInfo.bandScore
+                bandScore = parsedInfo.bandScore,
+                thumbnailUrl = entry.thumbnailUrl.ifBlank { "https://i.ytimg.com/vi/${entry.videoId}/hqdefault.jpg" },
+                publishedAt = displayPublished,
+                isLiveSynced = isLive
             )
             newLessons.add(lesson)
 
@@ -138,16 +426,19 @@ object YouTubeSyncRepository {
             newScenarios.add(scenario)
         }
 
-        // Merge dynamically fetched lessons with seeded baseline, deduplicating by title/videoId
+        // Merge dynamically fetched lessons with seeded baseline, deduplicating matching topics/lessons
         val mergedLessons = mutableListOf<YouTubeLesson>()
         mergedLessons.addAll(newLessons)
+        val liveTitlesLower = newLessons.map { it.titleEnglish.lowercase() }
         for (seed in YouTubeLessonData.lessonsList) {
-            if (mergedLessons.none { it.id == seed.id || it.titleEnglish.equals(seed.titleEnglish, ignoreCase = true) }) {
+            val isAlreadyCovered = mergedLessons.any { it.id == seed.id || it.titleEnglish.equals(seed.titleEnglish, ignoreCase = true) } ||
+                isSeedCoveredByLiveEntries(seed.id, liveTitlesLower)
+            if (!isAlreadyCovered) {
                 mergedLessons.add(seed)
             }
         }
 
-        // Merge dynamically generated scenarios with seeded baseline, deduplicating by id
+        // Merge dynamically generated scenarios with core baseline scenarios
         val mergedScenarios = mutableListOf<PracticeScenario>()
         mergedScenarios.addAll(newScenarios)
         for (seed in ScenarioData.scenariosList) {
@@ -156,8 +447,25 @@ object YouTubeSyncRepository {
             }
         }
 
-        _lessons.value = mergedLessons
-        _scenarios.value = mergedScenarios
+        _lessons.value = mergedLessons.distinctBy { it.id }
+        _scenarios.value = mergedScenarios.distinctBy { it.id }
+    }
+
+    private fun isSeedCoveredByLiveEntries(seedId: String, liveTitlesLower: List<String>): Boolean {
+        return when (seedId) {
+            "yt_ielts_vocab_interview" -> liveTitlesLower.any { it.contains("thirty_seven") || it.contains("lesson 37") }
+            "yt_ielts_vocab_travel" -> liveTitlesLower.any { it.contains("thirty_eight") || it.contains("lesson 38") }
+            "yt_ielts_vocab_arts" -> liveTitlesLower.any { it.contains("forty_ two") || it.contains("forty_two") || it.contains("lesson 42") }
+            "yt_grammar_relative_clauses" -> liveTitlesLower.any { it.contains("adjective clauses") || it.contains("lesson 8") }
+            else -> false
+        }
+    }
+
+    private fun formatPublishedDate(raw: String): String {
+        if (raw.isBlank()) return ""
+        // ISO format: 2026-11-17T06:15:29+00:00 -> 2026-11-17
+        val tIndex = raw.indexOf('T')
+        return if (tIndex > 0) raw.substring(0, tIndex) else raw
     }
 
     private data class ParsedVideoInfo(
@@ -182,12 +490,75 @@ object YouTubeSyncRepository {
     private fun parseVideoTitleAndDetails(rawTitle: String, rawDesc: String): ParsedVideoInfo {
         val cleanTitle = rawTitle.replace("/ Zahra Adibi", "")
             .replace("/Zahra Adibi", "")
+            .replace("Zahra Adibi", "")
             .trim()
+            .trimEnd('/', '|', '-', ' ')
 
         val lower = (rawTitle + " " + rawDesc).lowercase()
+        val lessonNum = extractLessonNumber(rawTitle.lowercase())
 
         return when {
-            lower.contains("children and the family") || lower.contains("lesson forty_ four") || lower.contains("lesson 44") -> {
+            lessonNum == 46 || (lower.contains("education") && lessonNum == null) -> {
+                ParsedVideoInfo(
+                    titlePersian = "درس ۴۶: واژگان آموزش، دانشگاه و سیستم آموزشی (Education)",
+                    titleEnglish = cleanTitle,
+                    category = "واژگان تخصصی آیلتس",
+                    seriesName = "Check Your English Vocabulary for IELTS",
+                    summaryPersian = "آموزش جامع واژگان و مکالمات موضوعی درباره تحصیل، مدارس، دانشگاه‌ها، اهداف آکادمیک و روش‌های نوین تدریس برای اسپیکینگ و رایتینگ.",
+                    keyPoints = listOf(
+                        "اصطلاحات دانشگاهی و تحصیلی: Curriculum, Academic achievement, Lifelong learning",
+                        "توصیف روش‌های تدریس و محیط‌های آموزشی: Interactive learning, Blended education",
+                        "پاسخ‌های حرفه‌ای پارت ۱ تا ۳ اسپیکینگ پیرامون نقش آموزش در آینده شغلی"
+                    ),
+                    bandScore = "Band 8.0+",
+                    scenarioTitlePersian = "آموزش و نظام دانشگاهی (درس ۴۶)",
+                    scenarioTitleEnglish = "Education & Academic Goals (Lesson 46)",
+                    scenarioCategory = "کسب‌وکار و شغل",
+                    difficultyLevel = "B2 (پیشرفته)",
+                    scenarioDescPersian = "تمرین مکالمه درباره سیستم‌های آموزشی، دانشگاه‌ها، مهارت‌آموزی و تجربه یادگیری بر پایه درس ۴۶ یوتیوب",
+                    initialAiGreeting = "Hello! Welcome to speaking practice for Lesson 46: Education. What qualities make a teaching method truly effective for learners?",
+                    initialAiTranslation = "سلام! به تمرین مکالمه درس ۴۶ (آموزش) خوش آمدید. چه ویژگی‌هایی یک روش تدریس را برای یادگیرندگان واقعاً مؤثر می‌سازد؟",
+                    systemPromptRole = "You are an IELTS Speaking Examiner discussing education systems, university life, and modern teaching methodologies based on Lesson 46.",
+                    keyPhrases = listOf(
+                        "Practical curricula bridge the gap between theory and career." to "برنامه‌های درسی کاربردی شکاف بین تئوری و شغل را پر می‌کنند.",
+                        "Lifelong learning is essential in a rapidly evolving job market." to "یادگیری مادام‌العمر در بازار کار پرشتاب امروزی ضروری است.",
+                        "Critical thinking should take precedence over rote memorization." to "تفکر نقادانه باید بر حفظ‌کردن طوطی‌وار اولویت داشته باشد.",
+                        "Access to quality education empowers entire communities." to "دسترسی به آموزش باکیفیت کل جوامع را توانمند می‌سازد."
+                    )
+                )
+            }
+
+            lessonNum == 45 || lower.contains("crime and the law") -> {
+                ParsedVideoInfo(
+                    titlePersian = "درس ۴۵: واژگان جرم، قانون و عدالت اجتماعی (Crime and the Law)",
+                    titleEnglish = cleanTitle,
+                    category = "واژگان تخصصی آیلتس",
+                    seriesName = "Check Your English Vocabulary for IELTS",
+                    summaryPersian = "یادگیری لغات تخصصی و کالوکیشن‌های کلیدی پیرامون قوانین، پیشگیری از جرم، مجازات، دادگاه و عدالت اجتماعی در تسک ۲ رایتینگ و اسپیکینگ.",
+                    keyPoints = listOf(
+                        "کالوکیشن‌های حقوقی و قضایی: Enforce the law, Deter crime, Rehabilitation",
+                        "انواع تخلفات و اقدامات قانونی: Petty offense, Juvenile delinquency, Legislation",
+                        "استدلال‌سازی آکادمیک درباره مجازات و پیشگیری از جرم در پارت ۳ اسپیکینگ"
+                    ),
+                    bandScore = "Band 8.0+",
+                    scenarioTitlePersian = "قانون، امنیت و پیشگیری از جرم (درس ۴۵)",
+                    scenarioTitleEnglish = "Crime, Justice & Law (Lesson 45)",
+                    scenarioCategory = "کسب‌وکار و شغل",
+                    difficultyLevel = "B2 (پیشرفته)",
+                    scenarioDescPersian = "تمرین استدلال انگلیسی درباره نقش قوانین، عدالت اجتماعی و راهکارهای پیشگیری از جرم بر مبنای درس ۴۵ یوتیوب",
+                    initialAiGreeting = "Welcome! In today's session from Lesson 45 (Crime and the Law), do you think rehabilitation programs are more effective than strict penalties?",
+                    initialAiTranslation = "خوش آمدید! در جلسه امروز از درس ۴۵ (جرم و قانون)، آیا فکر می‌کنید برنامه‌های بازپروری از مجازات‌های سخت‌گیرانه مؤثرترند؟",
+                    systemPromptRole = "You are an IELTS Speaking examiner evaluating arguments about legislation, crime prevention, and justice using Lesson 45 vocabulary.",
+                    keyPhrases = listOf(
+                        "Strict enforcement of laws acts as an effective deterrent." to "اجرای دقیق قوانین به عنوان یک عامل بازدارنده مؤثر عمل می‌کند.",
+                        "Rehabilitation programs reduce the likelihood of reoffending." to "برنامه‌های بازپروری احتمال تکرار جرم را کاهش می‌دهند.",
+                        "Addressing root socioeconomic causes prevents juvenile crime." to "رسیدگی به ریشه‌های اقتصادی-اجتماعی از بزهکاری نوجوانان پیشگیری می‌کند.",
+                        "Fair legislation safeguards citizens' fundamental rights." to "قانون‌گذاری عادلانه از حقوق بنیادین شهروندان محافظت می‌کند."
+                    )
+                )
+            }
+
+            lessonNum == 44 || lower.contains("children and the family") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۴۴: واژگان کودکان و روابط خانوادگی (Children and Family)",
                     titleEnglish = cleanTitle,
@@ -217,7 +588,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("business and industry") || lower.contains("lesson forty_ three") || lower.contains("lesson 43") -> {
+            lessonNum == 43 || lower.contains("business and industry") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۴۳: تجارت، صنایع و کارآفرینی (Business and Industry)",
                     titleEnglish = cleanTitle,
@@ -247,7 +618,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("the arts") || lower.contains("lesson forty_ two") || lower.contains("lesson 42") -> {
+            lessonNum == 42 || lower.contains("the arts") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۴۲: هنر، نقاشی و خلاقیت فرهنگی (The Arts)",
                     titleEnglish = cleanTitle,
@@ -276,7 +647,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("architecture") || lower.contains("lesson forty_ one") || lower.contains("lesson 41") -> {
+            lessonNum == 41 || lower.contains("architecture") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۴۱: معماری و شهرسازی (Architecture)",
                     titleEnglish = cleanTitle,
@@ -305,7 +676,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("how something works") || lower.contains("lesson forty") || lower.contains("lesson 40") -> {
+            lessonNum == 40 || lower.contains("how something works") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۴۰: نحوه کارکرد سیستم‌ها و فرآیندها (How Something Works)",
                     titleEnglish = cleanTitle,
@@ -334,7 +705,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("addition, equation, and conclusion") || lower.contains("lesson thirty_nine") || lower.contains("lesson 39") -> {
+            lessonNum == 39 || lower.contains("addition, equation, and conclusion") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۹: واژگان اضافه کردن، برابری و نتیجه‌گیری (Cohesive Linkers)",
                     titleEnglish = cleanTitle,
@@ -363,7 +734,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("around the world") || lower.contains("lesson thirty_eight") || lower.contains("lesson 38") -> {
+            lessonNum == 38 || lower.contains("around the world") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۸: سفر، گردشگری و کاوش جهان (Around the World)",
                     titleEnglish = cleanTitle,
@@ -392,7 +763,65 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("reciprocal pronouns") || lower.contains("lesson 10") -> {
+            lessonNum == 37 || lower.contains("interview expressions") -> {
+                ParsedVideoInfo(
+                    titlePersian = "درس ۳۷: واژگان و اصطلاحات طلایی مصاحبه (Interview Expressions)",
+                    titleEnglish = cleanTitle,
+                    category = "واژگان تخصصی آیلتس",
+                    seriesName = "Check Your English Vocabulary for IELTS",
+                    summaryPersian = "آموزش گنجینه لغات و ساختارهای کلیدی پاسخگویی به سوالات مصاحبه آیلتس و شغلی با تکنیک‌های بیان دستاوردها.",
+                    keyPoints = listOf(
+                        "کاربرد اصطلاحات تخصصی بیان تجارب کاری و تحصیلی در پاسخ‌های منسجم",
+                        "پاسخ به سوالات رفتاری با ساختار روش STAR (موقعیت، وظیفه، اقدام، نتیجه)",
+                        "کالوکیشن‌های رسمی برای بالا بردن نمره Lexical Resource به بالای ۷.۵"
+                    ),
+                    bandScore = "Band 7.5+",
+                    scenarioTitlePersian = "مصاحبه شغلی و آیلتس (درس ۳۷)",
+                    scenarioTitleEnglish = "Useful Interview Expressions (Lesson 37)",
+                    scenarioCategory = "کسب‌وکار و شغل",
+                    difficultyLevel = "B2 (پیشرفته)",
+                    scenarioDescPersian = "تمرین پاسخ به پرسش‌های مصاحبه با عبارت‌های طبیعی و حرفه‌ای بر مبنای درس ۳۷ یوتیوب",
+                    initialAiGreeting = "Welcome! Based on Lesson 37, let's practice interview expressions. How would you describe your greatest professional achievement?",
+                    initialAiTranslation = "خوش آمدید! بر اساس درس ۳۷، بیایید اصطلاحات مصاحبه را تمرین کنیم. بزرگ‌ترین دستاورد حرفه‌ای خود را چطور توصیف می‌کنید؟",
+                    systemPromptRole = "You are an executive interviewer and IELTS coach practicing persuasive interview expressions.",
+                    keyPhrases = listOf(
+                        "I take pride in delivering measurable results under pressure." to "به ارائه نتایج قابل سنجش زیر فشار کاری افتخار می‌کنم.",
+                        "Collaborating across departments enhanced our overall efficiency." to "همکاری بین دپارتمان‌ها بهره‌وری کلی ما را افزایش داد.",
+                        "I thrive in dynamic roles that demand continuous learning." to "من در نقش‌های پویا که نیازمند یادگیری مداوم هستند رشد می‌کنم."
+                    )
+                )
+            }
+
+            (lessonNum == 8 && (lower.contains("grammar") || lower.contains("adjective"))) || lower.contains("adjective clauses") || lower.contains("relative pronouns") -> {
+                ParsedVideoInfo(
+                    titlePersian = "درس ۸ گرامر: جملات پیرو و ضمایر موصولی (Adjective Clauses)",
+                    titleEnglish = cleanTitle,
+                    category = "گرامر ساختاری آیلتس",
+                    seriesName = "English Grammar Series",
+                    summaryPersian = "نحوه ساخت جملات مرکب و پیچیده با استفاده درست از ضمایر موصولی Who, Which, That, Whose جهت جهش نمره Grammatical Range.",
+                    keyPoints = listOf(
+                        "تفاوت Defining و Non-defining relative clauses و کاربرد ویرگول در آزمون رایتینگ",
+                        "ترکیب دو جمله ساده به یک ساختار ترکیبی منسجم در بخش اسپیکینگ",
+                        "پیشگیری از خطای تکرار فاعل یا مفعول در جملات موصولی"
+                    ),
+                    bandScore = "Band 7.5+",
+                    scenarioTitlePersian = "توصیف با جملات موصولی (درس ۸ گرامر)",
+                    scenarioTitleEnglish = "Adjective Clauses & Relative Pronouns (Lesson 8)",
+                    scenarioCategory = "زندگی روزمره",
+                    difficultyLevel = "B1 (متوسط)",
+                    scenarioDescPersian = "تمرین توصیف افراد، اشیاء و مکان‌ها با ضمایر موصولی Who, Which و That بر پایه درس ۸ گرامر یوتیوب",
+                    initialAiGreeting = "Hello! In Grammar Lesson 8, we practice Adjective Clauses. Can you describe a person who has deeply inspired your life?",
+                    initialAiTranslation = "سلام! در درس ۸ گرامر، جملات موصولی را تمرین می‌کنیم. می‌توانید فردی را توصیف کنید که عمیقاً الهام‌بخش زندگی شما بوده است؟",
+                    systemPromptRole = "You are an IELTS grammar tutor encouraging natural use of relative pronouns (who, which, that, whose, where).",
+                    keyPhrases = listOf(
+                        "She is the mentor who guided my academic journey." to "او استادی است که مسیر علمی مرا هدایت کرد.",
+                        "That is a book which profoundly changed my perspective." to "این کتابی است که دیدگاه مرا عمیقاً تغییر داد.",
+                        "The city where I grew up blends tradition with modernity." to "شهری که در آن بزرگ شدم سنت را با مدرنیته در هم می‌‌آمیزد."
+                    )
+                )
+            }
+
+            (lessonNum == 10 && lower.contains("grammar")) || lower.contains("reciprocal pronouns") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۱۰ گرامر: ضمایر متقابل (Each Other & One Another)",
                     titleEnglish = cleanTitle,
@@ -421,7 +850,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("reflexive pronouns") || lower.contains("lesson 9") -> {
+            (lessonNum == 9 && lower.contains("grammar")) || lower.contains("reflexive pronouns") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۹ گرامر: ضمایر انعکاسی و عبارت By Myself",
                     titleEnglish = cleanTitle,
@@ -450,7 +879,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("stopping something") || lower.contains("cancel, call off") || lower.contains("lesson thirty_three") || lower.contains("lesson 33") -> {
+            lessonNum == 33 || lower.contains("stopping something") || lower.contains("cancel, call off") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۳: اصطلاحات متوقف کردن و لغو (Cancel, Call off, Revoke, Repeal)",
                     titleEnglish = cleanTitle,
@@ -479,7 +908,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("success and failure") || lower.contains("lesson thirty_four") || lower.contains("lesson 34") -> {
+            lessonNum == 34 || lower.contains("success and failure") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۴: واژگان موفقیت و شکست (Success & Failure)",
                     titleEnglish = cleanTitle,
@@ -508,7 +937,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("task commands") || lower.contains("lesson thirty_five") || lower.contains("lesson 35") -> {
+            lessonNum == 35 || lower.contains("task commands") -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۵: افعال دستوری سوالات تحلیلی آیلتس (Task Commands)",
                     titleEnglish = cleanTitle,
@@ -537,7 +966,7 @@ object YouTubeSyncRepository {
                 )
             }
 
-            lower.contains("time") || lower.contains("lesson thirty_six") || lower.contains("lesson 36") -> {
+            lessonNum == 36 -> {
                 ParsedVideoInfo(
                     titlePersian = "درس ۳۶: واژگان و اصطلاحات مدیریت زمان (Time)",
                     titleEnglish = cleanTitle,
@@ -566,36 +995,110 @@ object YouTubeSyncRepository {
                 )
             }
 
-            else -> {
-                // Generic structured mapping for any other current or future video from the channel
-                val displayPersian = cleanTitle
-                val displayEnglish = cleanTitle
-                ParsedVideoInfo(
-                    titlePersian = "آموزش ویدیویی: $displayPersian",
-                    titleEnglish = displayEnglish,
-                    category = "واژگان تخصصی آیلتس",
-                    seriesName = "Adibi Learn Skills Official Series",
-                    summaryPersian = if (rawDesc.isNotBlank()) rawDesc.take(180) + "..." else "آموزش تخصصی از کانال رسمی خانم زهرا ادیبی.",
-                    keyPoints = listOf(
-                        "نکات آموزشی و ساختارهای کلیدی تدریس‌شده در ویدیو",
-                        "افزایش دایره واژگان مرتبط با سرفصل جهت ارتقای نمره آیلتس",
-                        "تمرین تعاملی در بخش مکالمه هوشمند اپلیکیشن"
-                    ),
-                    bandScore = "Band 7.0+",
-                    scenarioTitlePersian = "سناریوی تمرینی: $displayPersian",
-                    scenarioTitleEnglish = "Speaking Practice: $displayEnglish",
-                    scenarioCategory = "زندگی روزمره",
-                    difficultyLevel = "B1 (متوسط)",
-                    scenarioDescPersian = "تمرین مکالمه بر اساس جدیدترین محتوای منتشرشده در کانال یوتیوب خانم زهرا ادیبی",
-                    initialAiGreeting = "Hello! Let's practice speaking based on this lesson from Adibi Learn Skills: '$displayEnglish'. What are your thoughts on this topic?",
-                    initialAiTranslation = "سلام! بیایید مکالمه را بر اساس این درس از آکادمی ادیبی تمرین کنیم: '$displayEnglish'. نظر شما درباره این موضوع چیست؟",
-                    systemPromptRole = "You are an encouraging IELTS tutor conversing about the topic of this YouTube lesson.",
-                    keyPhrases = listOf(
-                        "This topic plays a significant role in fluent English speaking." to "این موضوع نقشی مهم در روان صحبت کردن انگلیسی ایفا می‌کند.",
-                        "Using precise terminology elevates your band score." to "استفاده از اصطلاحات دقیق نمره آزمون شما را ارتقا می‌دهد."
-                    )
-                )
-            }
+            else -> buildDynamicFallbackInfo(cleanTitle, rawDesc, lower)
         }
+    }
+
+    private fun buildDynamicFallbackInfo(cleanTitle: String, rawDesc: String, lower: String): ParsedVideoInfo {
+        val detectedCategory = when {
+            lower.contains("upgrade") -> "ارتقای گفتار (Upgrade)"
+            lower.contains("grammar") || lower.contains("pronoun") || lower.contains("clause") || lower.contains("tense") -> "گرامر ساختاری آیلتس"
+            lower.contains("picture") || lower.contains("speaking") || lower.contains("demo") || lower.contains("reading") -> "اسپیکینگ و توصیف تصویر"
+            else -> "واژگان تخصصی آیلتس"
+        }
+
+        val detectedSeries = when (detectedCategory) {
+            "ارتقای گفتار (Upgrade)" -> "Upgrade Your English Series"
+            "گرامر ساختاری آیلتس" -> "English Grammar for IELTS"
+            "اسپیکینگ و توصیف تصویر" -> "Speaking & Demo Teaching"
+            else -> "Check Your English Vocabulary for IELTS"
+        }
+
+        val scenarioCat = when {
+            lower.contains("business") || lower.contains("work") || lower.contains("job") || lower.contains("academic") -> "کسب‌وکار و شغل"
+            lower.contains("travel") || lower.contains("world") || lower.contains("airport") || lower.contains("hotel") -> "سفر و گردشگری"
+            else -> "زندگی روزمره"
+        }
+
+        val lessonNumber = extractLessonNumber(lower)
+        val persianPrefix = when {
+            detectedCategory == "ارتقای گفتار (Upgrade)" && lessonNumber != null -> "ارتقای مکالمه (قسمت ${toPersianDigits(lessonNumber)}): "
+            detectedCategory == "گرامر ساختاری آیلتس" && lessonNumber != null -> "درس ${toPersianDigits(lessonNumber)} گرامر: "
+            lessonNumber != null -> "درس ${toPersianDigits(lessonNumber)}: "
+            else -> "آموزش جدید کانال: "
+        }
+
+        val shortTopic = cleanTitle
+            .replace("Check Your English Vocabulary for IELTS", "", ignoreCase = true)
+            .replace("Upgrade Your English", "", ignoreCase = true)
+            .replace("English Grammar Lesson", "", ignoreCase = true)
+            .replace("English Grammar", "", ignoreCase = true)
+            .trim(' ', '/', '|', '-', ':')
+            .ifBlank { cleanTitle }
+
+        val cleanDesc = rawDesc.replace(Regex("#\\S+"), "").trim()
+        val summaryText = if (cleanDesc.isNotBlank()) {
+            "سرفصل اختصاصی جدید از کانال خانم زهرا ادیبی — ${cleanDesc.take(180)}"
+        } else {
+            "آموزش تخصصی جدید منتشرشده در کانال یوتیوب خانم زهرا ادیبی (@adibilearnskills): $cleanTitle"
+        }
+
+        return ParsedVideoInfo(
+            titlePersian = "$persianPrefix$shortTopic",
+            titleEnglish = cleanTitle,
+            category = detectedCategory,
+            seriesName = detectedSeries,
+            summaryPersian = summaryText,
+            keyPoints = listOf(
+                "آموزش کاربردی و ساختارهای کلیدی تدریس‌شده در ویدیوی $shortTopic",
+                "تقویت دایره لغات و اصطلاحات نیتیو جهت ارتقای نمره اسپیکینگ و رایتینگ آیلتس",
+                "تمرین مستقیم مکالمه این موضوع در بخش چت هوشمند اپلیکیشن"
+            ),
+            bandScore = "Band 7.5+",
+            scenarioTitlePersian = "تمرین مکالمه: $shortTopic",
+            scenarioTitleEnglish = "Practice: $shortTopic",
+            scenarioCategory = scenarioCat,
+            difficultyLevel = "B2 (پیشرفته)",
+            scenarioDescPersian = "تمرین تعاملی مکالمه انگلیسی متناسب با آموزش جدید «$cleanTitle» در کانال یوتیوب",
+            initialAiGreeting = "Hello! Let's practice English speaking based on the latest lesson from Adibi Learn Skills: \"$cleanTitle\". What key idea or vocabulary caught your attention in this topic?",
+            initialAiTranslation = "سلام! بیایید مکالمه انگلیسی را بر اساس جدیدترین درس کانال آکادمی ادیبی تمرین کنیم: «$cleanTitle». کدام نکته یا واژه در این موضوع بیشتر توجه شما را جلب کرد؟",
+            systemPromptRole = "You are an encouraging IELTS Speaking tutor guiding a realistic practice conversation specifically around the lesson '$cleanTitle'.",
+            keyPhrases = listOf(
+                "Using precise vocabulary makes my argument much clearer." to "استفاده از واژگان دقیق، استدلال من را بسیار شفاف‌تر می‌کند.",
+                "Let me illustrate this point with a practical real-life example." to "اجازه دهید این نکته را با یک مثال کاربردی از زندگی واقعی توضیح دهم.",
+                "Overall, mastering these expressions boosts speaking fluency." to "در مجموع، تسلط بر این اصطلاحات روانی مکالمه را افزایش می‌دهد."
+            )
+        )
+    }
+
+    private fun extractLessonNumber(rawLower: String): Int? {
+        val normalized = rawLower.replace('_', ' ').replace(Regex("\\s+"), " ")
+        Regex("""(?:lesson|part)\s+(\d+)""").find(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+            return it
+        }
+        val wordToNum = listOf(
+            "fifty" to 50,
+            "forty nine" to 49, "forty eight" to 48, "forty seven" to 47,
+            "forty six" to 46, "forty five" to 45, "forty four" to 44,
+            "forty three" to 43, "forty two" to 42, "forty one" to 41,
+            "forty" to 40,
+            "thirty nine" to 39, "thirty eight" to 38, "thirty seven" to 37,
+            "thirty six" to 36, "thirty five" to 35, "thirty four" to 34,
+            "thirty three" to 33, "thirty two" to 32, "thirty one" to 31,
+            "thirty" to 30,
+            "twenty nine" to 29, "twenty eight" to 28, "twenty seven" to 27,
+            "twenty six" to 26, "twenty five" to 25
+        )
+        for ((word, num) in wordToNum) {
+            if (normalized.contains(word)) return num
+        }
+        return null
+    }
+
+    private fun toPersianDigits(num: Int): String {
+        val persianDigits = charArrayOf('۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹')
+        return num.toString().map { ch ->
+            if (ch in '0'..'9') persianDigits[ch - '0'] else ch
+        }.joinToString("")
     }
 }

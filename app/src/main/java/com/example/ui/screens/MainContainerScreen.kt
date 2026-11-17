@@ -54,7 +54,7 @@ import com.example.ui.viewmodel.ChatViewModel
 import com.example.ui.viewmodel.VocabularyViewModel
 
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
 import com.example.data.repository.YouTubeSyncRepository
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,14 +63,15 @@ fun MainContainerScreen(
     chatViewModel: ChatViewModel = viewModel(),
     vocabularyViewModel: VocabularyViewModel = viewModel()
 ) {
-    val coroutineScope = rememberCoroutineScope()
+    val context = LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var isDeepSeekOpen by remember { mutableStateOf(false) }
 
-    // Automatically check and update educational lessons and scenarios from the official YouTube channel on app open
+    // Automatically load cached videos and sync latest educational lessons and scenarios from YouTube on app open
     LaunchedEffect(Unit) {
-        YouTubeSyncRepository.syncLatestContent(coroutineScope)
+        YouTubeSyncRepository.init(context)
+        YouTubeSyncRepository.syncLatestContent(context = context)
     }
 
     if (showAboutDialog) {

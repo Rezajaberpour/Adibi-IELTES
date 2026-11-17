@@ -11,7 +11,10 @@ data class YouTubeLesson(
     val keyPoints: List<String>,
     val targetScenarioId: String,
     val videoUrl: String = "https://youtube.com/@adibilearnskills?si=e9kQ2rrem3921gXT",
-    val bandScore: String = "IELTS 7.0+"
+    val bandScore: String = "IELTS 7.0+",
+    val thumbnailUrl: String = "",
+    val publishedAt: String = "",
+    val isLiveSynced: Boolean = false
 )
 
 object YouTubeLessonData {
